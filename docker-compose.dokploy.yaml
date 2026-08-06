@@ -26,7 +26,7 @@ version: "3.8"
 services:
   server:
     build: .
-    restart: unless-stopped
+    restart: on-failure
     entrypoint: ["/bin/sh", "-c"]
     command: ["blnk migrate up && blnk start"]
     environment:
@@ -41,18 +41,15 @@ services:
     expose:
       - "5001"
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      typesense:
-        condition: service_healthy
+      - postgres
+      - redis
+      - typesense
     networks:
       - dokploy-network
 
   worker:
     build: .
-    restart: unless-stopped
+    restart: on-failure
     entrypoint: ["blnk", "workers"]
     environment:
       BLNK_DATA_SOURCE_DNS: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/blnk?sslmode=disable
@@ -65,12 +62,9 @@ services:
     expose:
       - "5004"
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      typesense:
-        condition: service_healthy
+      - postgres
+      - redis
+      - typesense
     networks:
       - dokploy-network
 
