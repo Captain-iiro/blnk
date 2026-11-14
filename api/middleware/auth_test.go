@@ -73,6 +73,18 @@ func TestAuthMiddleware_Authenticate(t *testing.T) {
 	comprehensiveKey, err := blnkService.CreateAPIKey(context.Background(), "comprehensive-key", "test-owner", allPermissionsScopes, time.Now().Add(24*time.Hour))
 	assert.NoError(t, err)
 
+	metadataWriterKey, err := blnkService.CreateAPIKey(context.Background(), "metadata-writer", "test-owner", []string{"metadata:write"}, time.Now().Add(24*time.Hour))
+	assert.NoError(t, err)
+
+	wildcardAllKey, err := blnkService.CreateAPIKey(context.Background(), "wildcard-all", "test-owner", []string{"*:*"}, time.Now().Add(24*time.Hour))
+	assert.NoError(t, err)
+
+	wildcardWriteKey, err := blnkService.CreateAPIKey(context.Background(), "wildcard-write", "test-owner", []string{"*:write"}, time.Now().Add(24*time.Hour))
+	assert.NoError(t, err)
+
+	metadataWildcardActionKey, err := blnkService.CreateAPIKey(context.Background(), "metadata-wildcard-action", "test-owner", []string{"metadata:*"}, time.Now().Add(24*time.Hour))
+	assert.NoError(t, err)
+
 	tests := []struct {
 		name          string
 		path          string
@@ -551,6 +563,91 @@ func TestAuthMiddleware_Authenticate(t *testing.T) {
 			expectedCode:  http.StatusUnauthorized,
 			expectedError: "Invalid API key",
 		},
+		{
+			name:   "metadata:write scoped key allows POST /:id/metadata",
+			path:   "/:id/metadata",
+			method: "POST",
+			apiKey: metadataWriterKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:   "scoped key without metadata:write gets insufficient permissions not unknown resource",
+			path:   "/:id/metadata",
+			method: "POST",
+			apiKey: insufficientKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode:  http.StatusForbidden,
+			expectedError: "Insufficient permissions for metadata:write",
+		},
+		{
+			name:   "*:* wildcard scoped key allows POST /:id/metadata",
+			path:   "/:id/metadata",
+			method: "POST",
+			apiKey: wildcardAllKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:   "*:write wildcard scoped key allows POST /:id/metadata",
+			path:   "/:id/metadata",
+			method: "POST",
+			apiKey: wildcardWriteKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:   "metadata:* wildcard scoped key allows POST /:id/metadata",
+			path:   "/:id/metadata",
+			method: "POST",
+			apiKey: metadataWildcardActionKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:   "*:* wildcard scoped key allows POST /ldg_123/metadata",
+			path:   "/ldg_123/metadata",
+			method: "POST",
+			apiKey: wildcardAllKey.Key,
+			setupConfig: func() *config.Configuration {
+				return &config.Configuration{
+					Server: config.ServerConfig{
+						Secure: true,
+					},
+				}
+			},
+			expectedCode: http.StatusOK,
+		},
 	}
 
 	for _, tt := range tests {
@@ -588,6 +685,129 @@ func TestAuthMiddleware_Authenticate(t *testing.T) {
 			assert.Equal(t, tt.expectedCode, w.Code)
 			if tt.expectedError != "" {
 				assert.Contains(t, w.Body.String(), tt.expectedError)
+			}
+		})
+	}
+}
+
+func TestAuthMiddleware_ReadScopedKeysCanPOSTQueryRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service, err := setupBlnk()
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		path          string
+		scopes        []string
+		expectedCode  int
+		expectedError string
+	}{
+		{
+			name:         "ledgers filter accepts ledgers:read",
+			path:         "/ledgers/filter",
+			scopes:       []string{"ledgers:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "balances filter accepts balances:read",
+			path:         "/balances/filter",
+			scopes:       []string{"balances:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "accounts filter accepts accounts:read",
+			path:         "/accounts/filter",
+			scopes:       []string{"accounts:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "identities filter accepts identities:read",
+			path:         "/identities/filter",
+			scopes:       []string{"identities:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "transactions filter accepts transactions:read",
+			path:         "/transactions/filter",
+			scopes:       []string{"transactions:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "search collection accepts search:read",
+			path:         "/search/transactions",
+			scopes:       []string{"search:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "multi-search accepts search:read",
+			path:         "/multi-search",
+			scopes:       []string{"search:read"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "ledgers filter still accepts ledgers:write",
+			path:         "/ledgers/filter",
+			scopes:       []string{"ledgers:write"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "transactions filter still accepts transactions:write",
+			path:         "/transactions/filter",
+			scopes:       []string{"transactions:write"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "search collection still accepts search:write",
+			path:         "/search/transactions",
+			scopes:       []string{"search:write"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:          "creating a transaction still requires transactions:write",
+			path:          "/transactions",
+			scopes:        []string{"transactions:read"},
+			expectedCode:  http.StatusForbidden,
+			expectedError: "Insufficient permissions for transactions:write",
+		},
+		{
+			name:          "refund with id filter still requires transactions:write",
+			path:          "/refund-transaction/filter",
+			scopes:        []string{"transactions:read"},
+			expectedCode:  http.StatusForbidden,
+			expectedError: "Insufficient permissions for transactions:write",
+		},
+		{
+			name:          "search reindex still requires search:write",
+			path:          "/search/reindex",
+			scopes:        []string{"search:read"},
+			expectedCode:  http.StatusForbidden,
+			expectedError: "Insufficient permissions for search:write",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := service.CreateAPIKey(context.Background(), t.Name(), "test-owner", tt.scopes, time.Now().Add(time.Hour))
+			assert.NoError(t, err)
+
+			config.ConfigStore.Store(&config.Configuration{
+				Server: config.ServerConfig{Secure: true},
+			})
+
+			router := gin.New()
+			router.Any(tt.path, NewAuthMiddleware(service).Authenticate(), func(c *gin.Context) {
+				c.Status(http.StatusOK)
+			})
+
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.Header.Set(KeyHeader, key.Key)
+			router.ServeHTTP(recorder, req)
+
+			assert.Equal(t, tt.expectedCode, recorder.Code)
+			if tt.expectedError != "" {
+				assert.Contains(t, recorder.Body.String(), tt.expectedError)
 			}
 		})
 	}
@@ -657,6 +877,16 @@ func TestGetResourceFromPath(t *testing.T) {
 		{
 			name:     "Valid metadata path",
 			path:     "/metadata",
+			expected: ResourceMetadata,
+		},
+		{
+			name:     "/:id/metadata path",
+			path:     "/:id/metadata",
+			expected: ResourceMetadata,
+		},
+		{
+			name:     "/ldg_123/metadata entity path",
+			path:     "/ldg_123/metadata",
 			expected: ResourceMetadata,
 		},
 		{

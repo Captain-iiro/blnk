@@ -283,7 +283,6 @@ func (l *Blnk) validateTxn(ctx context.Context, transaction *model.Transaction) 
 	if txn {
 		err := fmt.Errorf("reference %s has already been used", transaction.Reference)
 		span.RecordError(err)
-		notification.NotifyError(err)
 		return err
 	}
 
@@ -387,9 +386,9 @@ func (r transactionExecutionResult) usedCoalescing() bool {
 func (l *Blnk) planTransactionExecution(transaction *model.Transaction, allowQueuedBatch, hotLane bool) transactionExecutionPlan {
 	if allowQueuedBatch {
 		if hotLane {
-			return transactionExecutionPlan{mode: transactionExecutionModeHotQueuedBatch, transaction: transaction}
+			return transactionExecutionPlan{mode: transactionExecutionModeHotQueuedBatch, transaction: transaction, viaQueue: true}
 		}
-		return transactionExecutionPlan{mode: transactionExecutionModeQueuedBatch, transaction: transaction}
+		return transactionExecutionPlan{mode: transactionExecutionModeQueuedBatch, transaction: transaction, viaQueue: true}
 	}
 
 	return transactionExecutionPlan{mode: transactionExecutionModeSingle, transaction: transaction}
@@ -410,7 +409,10 @@ func (l *Blnk) executeTransactionPlan(ctx context.Context, plan transactionExecu
 				transaction: plan.transaction,
 			}, nil
 		}
-		return l.executeTransactionPlan(ctx, l.planTransactionExecution(plan.transaction, false, false))
+		// Falling back from a queued batch to single-transaction processing;
+		// this is still queue-originated work, so keep viaQueue true rather
+		// than re-deriving the plan from scratch.
+		return l.executeTransactionPlan(ctx, transactionExecutionPlan{mode: transactionExecutionModeSingle, transaction: plan.transaction, viaQueue: true})
 	case transactionExecutionModeHotQueuedBatch:
 		handled, err := l.TryRecordQueuedTransactionBatchForHotLane(ctx, plan.transaction)
 		if err != nil {
@@ -422,9 +424,9 @@ func (l *Blnk) executeTransactionPlan(ctx context.Context, plan transactionExecu
 				transaction: plan.transaction,
 			}, nil
 		}
-		return l.executeTransactionPlan(ctx, l.planTransactionExecution(plan.transaction, false, false))
+		return l.executeTransactionPlan(ctx, transactionExecutionPlan{mode: transactionExecutionModeSingle, transaction: plan.transaction, viaQueue: true})
 	case transactionExecutionModeSingle:
-		transaction, err := l.recordTransactionSingle(ctx, plan.transaction)
+		transaction, err := l.recordTransactionSingle(ctx, plan.transaction, plan.viaQueue)
 		if err != nil {
 			return transactionExecutionResult{}, err
 		}
@@ -433,7 +435,7 @@ func (l *Blnk) executeTransactionPlan(ctx context.Context, plan transactionExecu
 			transaction: transaction,
 		}, nil
 	default:
-		transaction, err := l.recordTransactionSingle(ctx, plan.transaction)
+		transaction, err := l.recordTransactionSingle(ctx, plan.transaction, plan.viaQueue)
 		if err != nil {
 			return transactionExecutionResult{}, err
 		}
@@ -486,9 +488,39 @@ func (l *Blnk) RecordTransaction(ctx context.Context, transaction *model.Transac
 	return result.transaction, nil
 }
 
+// handleZeroAmountTransaction resolves a zero-amount transaction encountered during single
+// processing.
+//
+// Queue-originated processing (viaQueue=true) must persist a REJECTED record: a QUEUED parent
+// with no terminal child is picked up by stuck-queue recovery forever (see
+// GetStuckQueuedTransactions), so silently discarding it here would recreate the original
+// stuck-recovery bug this behavior exists to fix.
+//
+// Direct/split-leg processing (viaQueue=false) preserves the original semantics from issue
+// #142/#334: a leg that legitimately rounds down to zero (e.g. a small share of a split
+// transaction) is discarded without persisting anything and without an error, since it was
+// never queued and so can never get stuck.
+func (l *Blnk) handleZeroAmountTransaction(ctx context.Context, span trace.Span, transaction *model.Transaction, viaQueue bool, rejectedEventName string) (*model.Transaction, error) {
+	if !viaQueue {
+		span.AddEvent("Zero-amount transaction discarded, not persisted", trace.WithAttributes(attribute.String("transaction.id", transaction.TransactionID)))
+		return transaction, nil
+	}
+
+	rejected, err := l.RejectTransaction(ctx, transaction, "zero amount")
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	span.AddEvent(rejectedEventName, trace.WithAttributes(attribute.String("transaction.id", rejected.TransactionID)))
+	return rejected, nil
+}
+
 // recordTransactionSingle preserves the existing direct transaction-processing semantics by
 // running the single-transaction flow under the balance lock.
-func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.Transaction) (*model.Transaction, error) {
+//
+// viaQueue indicates whether this call originated from queued transaction processing, which
+// controls how a zero-amount transaction is resolved; see handleZeroAmountTransaction.
+func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.Transaction, viaQueue bool) (*model.Transaction, error) {
 	ctx, span := tracer.Start(ctx, "RecordTransaction")
 	defer span.End()
 
@@ -508,6 +540,10 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 			return nil, err
 		}
 
+		if isZeroPreciseAmount(transaction) {
+			return l.handleZeroAmountTransaction(ctx, span, transaction, viaQueue, "Zero-amount transaction rejected")
+		}
+
 		// Process the balances by applying the transaction
 		if err := l.processBalances(ctx, transaction, sourceBalance, destinationBalance); err != nil {
 			span.RecordError(err)
@@ -516,8 +552,7 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 
 		work, skipPersist := l.buildTransactionExecutionWork(ctx, transaction, sourceBalance, destinationBalance)
 		if skipPersist {
-			span.AddEvent("Transaction with zero amount discarded, not persisted", trace.WithAttributes(attribute.String("transaction.id", work.transaction.TransactionID)))
-			return work.transaction, nil
+			return l.handleZeroAmountTransaction(ctx, span, work.transaction, viaQueue, "Zero-amount transaction rejected instead of discarded")
 		}
 
 		work, err = l.persistSingleTransactionExecutionWork(ctx, work)
@@ -529,7 +564,6 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 		l.runTransactionPostCommitWork(ctx, span, []*model.Balance{sourceBalance, destinationBalance}, []queuedBatchPostCommitWork{work})
 
 		span.AddEvent("Transaction processed", trace.WithAttributes(attribute.String("transaction.id", work.transaction.TransactionID)))
-		logrus.Infof("Transaction %s processed successfully", work.transaction.TransactionID)
 		return work.transaction, nil
 	})
 
@@ -728,11 +762,14 @@ func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *m
 		}, true
 	}
 
+	outbox := l.prepareTransactionOutbox(ctx, transaction, sourceBalance, destinationBalance)
+	clearTerminalInflightMetadata(transaction)
+
 	return queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
-		outbox:             l.prepareTransactionOutbox(ctx, transaction, sourceBalance, destinationBalance),
+		outbox:             outbox,
 	}, false
 }
 

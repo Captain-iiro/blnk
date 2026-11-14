@@ -18,11 +18,12 @@ package blnk
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/internal/notification"
@@ -32,6 +33,24 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// isAlreadyExists reports whether err means the balance already exists
+// (apierror.ErrConflict), e.g. a duplicate (indicator, currency) pair from
+// CreateBalance. Used by get-or-create so a concurrent create race can fall
+// through to a re-fetch instead of failing. Checking the error code (rather
+// than an empty balance ID or a substring of the message) keeps this resilient
+// to message changes.
+func isAlreadyExists(err error) bool {
+	var apiErr apierror.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == apierror.ErrConflict
+	}
+	var apiErrPtr *apierror.APIError
+	if errors.As(err, &apiErrPtr) && apiErrPtr != nil {
+		return apiErrPtr.Code == apierror.ErrConflict
+	}
+	return false
+}
 
 // balanceTracer is an OpenTelemetry tracer for tracking balance-related transactions.
 var (
@@ -58,7 +77,7 @@ func NewBalanceTracker() *model.BalanceTracker {
 // - ctx context.Context: The context for the operation.
 // - updatedBalance *model.Balance: A pointer to the updated Balance model.
 func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.Balance) {
-	_, span := balanceTracer.Start(ctx, "CheckBalanceMonitors")
+	ctx, span := balanceTracer.Start(ctx, "CheckBalanceMonitors")
 	defer span.End()
 
 	// Fetch monitors using cache (avoids DB query on every transaction)
@@ -71,19 +90,54 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 
 	// Check each monitor's condition
 	for _, monitor := range monitors {
-		if monitor.CheckCondition(updatedBalance) {
-			span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
-			go func(monitor model.BalanceMonitor) {
-				err := l.SendWebhook(NewWebhook{
-					Event:   "balance.monitor",
-					Payload: monitor,
-				})
-				if err != nil {
+		met := monitor.CheckCondition(updatedBalance)
+
+		if monitor.TriggerMode() == model.TriggerLevel {
+			if met {
+				span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
+				if err := l.sendMonitorWebhook(monitor); err != nil {
 					notification.NotifyError(err)
 				}
-			}(monitor)
+			}
+			continue
+		}
+
+		// Edge: the state transition decides, not the condition. The cached
+		// monitor is only trusted for its trigger mode and condition; the state
+		// lives in the database, where concurrent evaluations of the same
+		// balance serialise against each other.
+		owned, err := l.datasource.TransitionMonitorState(ctx, monitor.MonitorID, updatedBalance.BalanceID, met, updatedBalance.Version)
+		if err != nil {
+			span.RecordError(err)
+			notification.NotifyError(err)
+			continue
+		}
+		if !owned || !met {
+			continue
+		}
+
+		span.AddEvent(fmt.Sprintf("Condition crossed for balance: %s", monitor.MonitorID))
+		crossed := true
+		monitor.ConditionState = &crossed
+		if err := l.sendMonitorWebhook(monitor); err != nil {
+			notification.NotifyError(err)
+			// An edge fires once, so a transition that could not be handed off
+			// has to be given back or the crossing is lost for good.
+			if releaseErr := l.datasource.ReleaseMonitorState(ctx, monitor.MonitorID, updatedBalance.BalanceID, updatedBalance.Version); releaseErr != nil {
+				span.RecordError(releaseErr)
+				notification.NotifyError(releaseErr)
+			}
 		}
 	}
+}
+
+// sendMonitorWebhook enqueues the balance.monitor notification for a monitor
+// whose condition has been met.
+func (l *Blnk) sendMonitorWebhook(monitor model.BalanceMonitor) error {
+	return l.SendWebhook(NewWebhook{
+		Event:   "balance.monitor",
+		Payload: monitor,
+	})
 }
 
 // getBalanceMonitorsCached retrieves balance monitors with caching.
@@ -153,7 +207,7 @@ func (l *Blnk) getOrCreateBalanceByIndicator(ctx context.Context, indicator, cur
 			Currency:  currency,
 		}
 		_, err := l.CreateBalance(ctx, *balance)
-		if err != nil && !strings.Contains(err.Error(), "Balance already exist") {
+		if err != nil && !isAlreadyExists(err) {
 			span.RecordError(err)
 			return nil, err
 		}
@@ -236,6 +290,7 @@ func (l *Blnk) CreateBalance(ctx context.Context, balance model.Balance) (model.
 		span.RecordError(err)
 		return model.Balance{}, err
 	}
+
 	l.postBalanceActions(ctx, &balance)
 	metrics.BalanceCreatedTotal.Add(ctx, 1)
 	span.AddEvent("Balance created", trace.WithAttributes(attribute.String("balance.id", balance.BalanceID)))
@@ -342,9 +397,7 @@ func (l *Blnk) CreateMonitor(ctx context.Context, monitor model.BalanceMonitor) 
 	_, span := balanceTracer.Start(ctx, "CreateMonitor")
 	defer span.End()
 
-	amount := int64(monitor.Condition.Value * monitor.Condition.Precision) // apply precision to value
-	amountBigInt := model.Int64ToBigInt(amount)
-	monitor.Condition.PreciseValue = amountBigInt
+	monitor.Condition.PreciseValue = model.MonitorPreciseValue(monitor.Condition.Value, monitor.Condition.Precision)
 	monitor, err := l.datasource.CreateMonitor(monitor)
 	if err != nil {
 		span.RecordError(err)
@@ -435,16 +488,78 @@ func (l *Blnk) GetBalanceMonitors(ctx context.Context, balanceID string) ([]mode
 // Returns:
 // - error: An error if the monitor could not be updated.
 func (l *Blnk) UpdateMonitor(ctx context.Context, monitor *model.BalanceMonitor) error {
-	_, span := balanceTracer.Start(ctx, "UpdateMonitor")
+	ctx, span := balanceTracer.Start(ctx, "UpdateMonitor")
 	defer span.End()
 
-	err := l.datasource.UpdateMonitor(monitor)
+	// An update may move the monitor to a different balance, and the cache is
+	// keyed by balance: without the previous ID the monitor stays in the old
+	// balance's cached list and keeps being evaluated against a balance it no
+	// longer watches.
+	previous, err := l.datasource.GetMonitorByID(monitor.MonitorID)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
+	// PUT is a partial update: omitted fields keep the stored row. Empty
+	// strings and a missing precision arrive as zero values and would
+	// overwrite the row (or 500 on the table's check constraint). Value and
+	// description are the exceptions: 0 and "" are real values, so only a
+	// missing JSON key (or a Go caller that never called SetValue /
+	// SetDescription) keeps the stored one. The official SDK rename sends
+	// value 0 with the field and operator keys present and empty; that shape
+	// keeps the stored line. A body that sends value 0 and leaves those keys
+	// out moves the line to zero. A lone precision change is ignored when
+	// value was omitted, or the stored line would move. The caller is told
+	// when that happens.
+	if monitor.BalanceID == "" {
+		monitor.BalanceID = previous.BalanceID
+	}
+	if !monitor.DescriptionSpecified() && monitor.Description == "" {
+		monitor.Description = previous.Description
+	}
+	incomingField := monitor.Condition.Field
+	incomingOperator := monitor.Condition.Operator
+	if incomingField == "" {
+		monitor.Condition.Field = previous.Condition.Field
+	}
+	if incomingOperator == "" {
+		monitor.Condition.Operator = previous.Condition.Operator
+	}
+	// Official Go clients always send value:0 with the field and operator
+	// keys present and empty on a rename. That is not an explicit zero.
+	// {"condition":{"value":0}} leaves those keys out and is. SetValue(0) is too.
+	sdkZero := !monitor.Condition.ValueForced() &&
+		monitor.Condition.ValueSpecified() &&
+		monitor.Condition.Value == 0 &&
+		monitor.Condition.FieldSpecified() && incomingField == "" &&
+		monitor.Condition.OperatorSpecified() && incomingOperator == ""
+	valueOmitted := (!monitor.Condition.ValueSpecified() && monitor.Condition.Value == 0) || sdkZero
+	incomingPrecision := monitor.Condition.Precision
+	if incomingPrecision == 0 || valueOmitted {
+		monitor.Condition.Precision = previous.Condition.Precision
+	}
+	if valueOmitted && incomingPrecision != 0 && incomingPrecision != previous.Condition.Precision {
+		monitor.MarkPrecisionUnchanged()
+	}
+	if valueOmitted {
+		monitor.Condition.Value = previous.Condition.Value
+	}
+	if err := monitor.Condition.Validate(); err != nil {
+		span.RecordError(err)
+		return apierror.NewAPIError(apierror.ErrGenValidation, err.Error(), err)
+	}
+	monitor.Condition.PreciseValue = model.MonitorPreciseValue(monitor.Condition.Value, monitor.Condition.Precision)
+
+	if err := l.datasource.UpdateMonitor(monitor); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
 	_ = l.cache.Delete(ctx, "monitors:"+monitor.BalanceID)
+	if previous.BalanceID != monitor.BalanceID {
+		_ = l.cache.Delete(ctx, "monitors:"+previous.BalanceID)
+	}
 
 	span.AddEvent("Monitor updated", trace.WithAttributes(attribute.String("monitor.id", monitor.MonitorID)))
 	return nil

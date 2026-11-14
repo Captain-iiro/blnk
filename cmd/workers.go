@@ -37,24 +37,17 @@ import (
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/hotpairs"
 	"github.com/blnkfinance/blnk/internal/metrics"
-	"github.com/blnkfinance/blnk/internal/notification"
 	redis_db "github.com/blnkfinance/blnk/internal/redis-db"
 	"github.com/blnkfinance/blnk/internal/search"
 	trace "github.com/blnkfinance/blnk/internal/traces"
 	"github.com/blnkfinance/blnk/model"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/hibiken/asynq"
 	"github.com/hibiken/asynqmon"
 )
-
-// indexData represents the data structure used for indexing data in the system.
-// It includes the collection name and the payload which is the data to be indexed.
-type indexData struct {
-	Collection string                 `json:"collection"`
-	Payload    map[string]interface{} `json:"payload"`
-}
 
 // processTransaction processes a transaction received from the Redis queue.
 // If a transaction fails due to "insufficient funds", it is rejected, and a webhook is sent.
@@ -71,30 +64,32 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 		return err
 	}
 
-	handled, err := b.blnk.TryRecordQueuedTransactionBatch(ctx, &txn)
-	if b.cnf.Queue.EnableHotLane && t.Type() == b.cnf.Queue.HotQueueName {
-		handled, err = b.blnk.TryRecordQueuedTransactionBatchForHotLane(ctx, &txn)
-	}
-	if err != nil {
-		logrus.WithError(err).Warnf("coalesced processing attempt failed for transaction %s", txn.TransactionID)
-	}
-	if handled {
-		metrics.QueueProcessingDuration.Record(ctx, time.Since(startTime).Seconds(),
-			otelmetric.WithAttributes(attribute.String("result", "success")),
-		)
-		return nil
-	}
-	_, err = b.blnk.ProcessQueuedTransaction(ctx, &txn, b.cnf.Queue.EnableHotLane && t.Type() == b.cnf.Queue.HotQueueName)
+	// The items of a queued atomic bulk request run one at a time under the
+	// batch lock; once the batch has failed, the rest are rejected unapplied.
+	return b.blnk.WithQueuedAtomicBatch(ctx, &txn, func(batchFailed bool) error {
+		if batchFailed {
+			return handleTransactionRejection(ctx, b, &txn, blnk.ErrAtomicBatchFailed)
+		}
+		return b.recordQueuedTransaction(ctx, span, t, &txn, startTime)
+	})
+}
+
+// recordQueuedTransaction applies a transaction taken from the queue, and
+// retries or rejects it when that fails.
+func (b *blnkInstance) recordQueuedTransaction(ctx context.Context, span oteltrace.Span, t *asynq.Task, txn *model.Transaction, startTime time.Time) error {
+	// ProcessQueuedTransaction tries the coalesced batch first and falls back to the
+	// single-transaction path itself, so the batch is attempted only once per task.
+	_, err := b.blnk.ProcessQueuedTransaction(ctx, txn, b.cnf.Queue.EnableHotLane && t.Type() == b.cnf.Queue.HotQueueName)
 	if err != nil {
 		// Handle reference already used error
 		if blnk.IsDuplicateReferenceError(err) {
-			notification.NotifyError(err)
+			span.RecordError(err)
 			return nil
 		}
 
 		if strings.Contains(strings.ToLower(err.Error()), "insufficient funds") {
 			if !b.cnf.Queue.InsufficientFundRetries {
-				return handleTransactionRejection(ctx, b, &txn, err)
+				return handleTransactionRejection(ctx, b, txn, err)
 			}
 
 			retryCount, _ := asynq.GetRetryCount(ctx)
@@ -104,7 +99,7 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 					"retry_count":    retryCount,
 					"max_retries":    b.cnf.Queue.MaxRetryAttempts,
 				}).Warn("Transaction reached max retry attempts; rejecting with final processing error")
-				return handleTransactionRejection(ctx, b, &txn, err)
+				return handleTransactionRejection(ctx, b, txn, err)
 			}
 
 			logrus.Infof("Insufficient funds for transaction %s, retry attempt %d/%d",
@@ -116,7 +111,7 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 		}
 
 		if strings.Contains(strings.ToLower(err.Error()), "transaction exceeds overdraft limit") {
-			return handleTransactionRejection(ctx, b, &txn, err)
+			return handleTransactionRejection(ctx, b, txn, err)
 		}
 
 		if shouldRejectLockContentionImmediately(b.cnf, err) {
@@ -124,7 +119,7 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 				"transaction_id": txn.TransactionID,
 				"error":          err.Error(),
 			}).Warn("Rejecting transaction immediately due to lock contention policy")
-			return handleTransactionRejection(ctx, b, &txn, err)
+			return handleTransactionRejection(ctx, b, txn, err)
 		}
 
 		retryCount, _ := asynq.GetRetryCount(ctx)
@@ -135,7 +130,7 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 				"max_retries":    b.cnf.Queue.MaxRetryAttempts,
 				"error":          err.Error(),
 			}).Warn("Transaction reached max retry attempts; rejecting with final processing error")
-			return handleTransactionRejection(ctx, b, &txn, err)
+			return handleTransactionRejection(ctx, b, txn, err)
 		}
 
 		logrus.Infof("Transaction %s pushed back for retry due to error: %v", txn.TransactionID, err)
@@ -153,14 +148,19 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 }
 
 func handleTransactionRejection(ctx context.Context, b *blnkInstance, txn *model.Transaction, err error) error {
-	_, rejectErr := b.blnk.RejectTransaction(ctx, txn, err.Error())
+	rejected, rejectErr := b.blnk.RejectTransaction(ctx, txn, err.Error())
 	if rejectErr != nil {
 		return rejectErr
+	}
+	// An item of a failed atomic batch that was applied before the batch
+	// failed is rolled back, not rejected.
+	if rejected.Status != blnk.StatusRejected {
+		return nil
 	}
 
 	webhookErr := b.blnk.SendWebhook(blnk.NewWebhook{
 		Event:   "transaction.rejected",
-		Payload: *txn,
+		Payload: *rejected,
 	})
 	return webhookErr
 }
@@ -213,19 +213,14 @@ func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 		return nil
 	}
 
-	var data indexData
+	var task blnk.IndexTask
 
-	// Unmarshal the indexing data from the task payload.
-	if err := json.Unmarshal(t.Payload(), &data); err != nil {
+	if err := json.Unmarshal(t.Payload(), &task); err != nil {
 		logrus.Error(err)
 		return err
 	}
 
-	collection := data.Collection
-	payload := data.Payload
-
-	// Initialize a new TypeSense client and ensure collections exist.
-	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
+	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns}, search.DefaultTimeout)
 	err := newSearch.EnsureCollectionsExist(ctx)
 	if err != nil {
 		err = markWorkerSearchBackpressure(ctx, err)
@@ -235,17 +230,25 @@ func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 
-	// Handle the notification and send the payload to the collection for indexing.
-	err = newSearch.HandleNotification(ctx, collection, payload)
-	if err != nil {
-		err = markWorkerSearchBackpressure(ctx, err)
-		if !errors.Is(err, search.ErrMemoryBackpressure) {
-			logrus.Error("Error indexing data", err)
+	err = b.blnk.ProcessIndexTask(ctx, task, func(ctx context.Context, collection string, document interface{}) error {
+		payload, err := blnk.DocumentToIndexMap(document)
+		if err != nil {
+			return err
 		}
+		if err := newSearch.HandleNotification(ctx, collection, payload); err != nil {
+			err = markWorkerSearchBackpressure(ctx, err)
+			if !errors.Is(err, search.ErrMemoryBackpressure) {
+				logrus.Error("Error indexing data", err)
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 
-	logrus.Infof(" [*] Data indexed: %s", collection)
+	logrus.Infof(" [*] Data indexed: %s", task.Collection)
 	return nil
 }
 
@@ -266,7 +269,7 @@ func (b *blnkInstance) indexBatchData(ctx context.Context, t *asynq.Task) error 
 	}
 
 	// Initialize a new TypeSense client and ensure collections exist.
-	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
+	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns}, search.DefaultTimeout)
 	err := newSearch.EnsureCollectionsExist(ctx)
 	if err != nil {
 		err = markWorkerSearchBackpressure(ctx, err)
@@ -328,22 +331,27 @@ func (b *blnkInstance) processInflightCommit(ctx context.Context, t *asynq.Task)
 }
 
 // processInflightExpiry handles the expiry of inflight transactions.
-// It voids the transaction by its ID and logs the action.
-func (b *blnkInstance) processInflightExpiry(cxt context.Context, t *asynq.Task) error {
+// The scheduled id is the one returned at enqueue time. For a queued hold that
+// is the QUEUED placeholder, not the INFLIGHT "_q" row that reserved the money.
+// Resolve it to those legs, the same way a commit does, and void the legs. A
+// leg that is already committed or voided is terminal: ack it, and do not
+// release inflight balance a second time.
+func (b *blnkInstance) processInflightExpiry(ctx context.Context, t *asynq.Task) error {
 	var txnID string
-	// Unmarshal the transaction ID from the task payload.
 	if err := json.Unmarshal(t.Payload(), &txnID); err != nil {
 		logrus.Error(err)
 		return err
 	}
 
-	// Void the inflight transaction by its ID.
-	_, err := b.blnk.VoidInflightTransaction(cxt, txnID)
-	if err != nil {
+	// txnID is the action id so a retry of this task replays the void it
+	// already wrote instead of releasing the amount again.
+	retryable, err := b.blnk.RunInflightActionByParent(ctx, txnID, blnk.InflightActionVoid, big.NewInt(0), txnID)
+	if err != nil && retryable {
 		return err
 	}
-
-	logrus.Printf(" [*] Inflight Transaction Expired %s", txnID)
+	if err != nil {
+		logrus.WithError(err).WithField("transaction_id", txnID).Error("inflight expiry failed permanently; acking task")
+	}
 	return nil
 }
 
@@ -394,20 +402,28 @@ func initializeWebhookQueues() map[string]int {
 	return queues
 }
 
-func initializeWebhookWorkerServer(conf *config.Configuration, queues map[string]int) (*asynq.Server, error) {
-	redisOption, err := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+// workerRedisConnOpt builds an asynq connection option whose pooled
+// connections are recycled before managed Redis/Valkey idle-closes them.
+func workerRedisConnOpt(conf *config.Configuration) (redis_db.ConnOpt, error) {
+	connOpt, err := redis_db.NewConnOpt(conf.Redis.Dns, conf.Redis.SkipTLSVerify, &redis_db.PoolConfig{
+		PoolSize:        conf.Redis.PoolSize,
+		MinIdleConns:    conf.Redis.MinIdleConns,
+		ConnMaxIdleTime: conf.Redis.ConnMaxIdleTime,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("error parsing Redis URL: %v", err)
+		return redis_db.ConnOpt{}, fmt.Errorf("error parsing Redis URL: %v", err)
+	}
+	return connOpt, nil
+}
+
+func initializeWebhookWorkerServer(conf *config.Configuration, queues map[string]int) (*asynq.Server, error) {
+	connOpt, err := workerRedisConnOpt(conf)
+	if err != nil {
+		return nil, err
 	}
 
 	return asynq.NewServer(
-		asynq.RedisClientOpt{
-			Addr:      redisOption.Addr,
-			Password:  redisOption.Password,
-			DB:        redisOption.DB,
-			TLSConfig: redisOption.TLSConfig,
-			PoolSize:  conf.Redis.PoolSize,
-		},
+		connOpt,
 		asynq.Config{
 			Concurrency:     conf.Queue.WebhookConcurrency,
 			Queues:          queues,
@@ -419,19 +435,13 @@ func initializeWebhookWorkerServer(conf *config.Configuration, queues map[string
 }
 
 func initializeWorkerServer(conf *config.Configuration, queues map[string]int) (*asynq.Server, error) {
-	redisOption, err := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+	connOpt, err := workerRedisConnOpt(conf)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing Redis URL: %v", err)
+		return nil, err
 	}
 
 	return asynq.NewServer(
-		asynq.RedisClientOpt{
-			Addr:      redisOption.Addr,
-			Password:  redisOption.Password,
-			DB:        redisOption.DB,
-			TLSConfig: redisOption.TLSConfig,
-			PoolSize:  conf.Redis.PoolSize,
-		},
+		connOpt,
 		asynq.Config{
 			Concurrency:     conf.Queue.TransactionWorkerConcurrency,
 			Queues:          queues,
@@ -441,19 +451,13 @@ func initializeWorkerServer(conf *config.Configuration, queues map[string]int) (
 }
 
 func initializeHotWorkerServer(conf *config.Configuration, queues map[string]int) (*asynq.Server, error) {
-	redisOption, err := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+	connOpt, err := workerRedisConnOpt(conf)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing Redis URL: %v", err)
+		return nil, err
 	}
 
 	return asynq.NewServer(
-		asynq.RedisClientOpt{
-			Addr:      redisOption.Addr,
-			Password:  redisOption.Password,
-			DB:        redisOption.DB,
-			TLSConfig: redisOption.TLSConfig,
-			PoolSize:  conf.Redis.PoolSize,
-		},
+		connOpt,
 		asynq.Config{
 			Concurrency:     conf.Queue.HotQueueConcurrency,
 			Queues:          queues,
@@ -622,16 +626,13 @@ func setupWorkerServers(b *blnkInstance, conf *config.Configuration) (*asynq.Ser
 }
 
 func startMonitoringServer(conf *config.Configuration) *http.Server {
-	redisOption, _ := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+	connOpt, err := workerRedisConnOpt(conf)
+	if err != nil {
+		logrus.Errorf("monitoring server redis setup failed: %v", err)
+	}
 	asynqmonHandler := asynqmon.New(asynqmon.Options{
-		RootPath: "/monitoring",
-		RedisConnOpt: asynq.RedisClientOpt{
-			Addr:      redisOption.Addr,
-			Password:  redisOption.Password,
-			DB:        redisOption.DB,
-			TLSConfig: redisOption.TLSConfig,
-			PoolSize:  conf.Redis.PoolSize,
-		},
+		RootPath:     "/monitoring",
+		RedisConnOpt: connOpt,
 	})
 
 	monitoringMux := http.NewServeMux()

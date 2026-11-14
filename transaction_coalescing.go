@@ -18,6 +18,7 @@ package blnk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -25,13 +26,16 @@ import (
 	"github.com/blnkfinance/blnk/internal/hotpairs"
 	redlock "github.com/blnkfinance/blnk/internal/lock"
 	"github.com/blnkfinance/blnk/internal/metrics"
-	"github.com/blnkfinance/blnk/internal/notification"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// errQueuedBatchLeaderApplied reports that another batch applied the leader while this one
+// was waiting for the balance-set lock.
+var errQueuedBatchLeaderApplied = errors.New("queued batch leader already applied")
 
 func (l *Blnk) TryRecordQueuedTransactionBatch(ctx context.Context, transaction *model.Transaction) (handled bool, err error) {
 	return l.tryRecordQueuedTransactionBatch(ctx, transaction, false)
@@ -64,6 +68,30 @@ func (l *Blnk) tryRecordQueuedTransactionBatch(ctx context.Context, transaction 
 		return false, nil
 	}
 
+	// An earlier batch may already have applied this transaction as one of its siblings, while
+	// its own queue task was still pending. Its work is done, so acknowledge it rather than
+	// building, locking and validating a batch around it that is bound to fail open.
+	applied, err := l.datasource.QueuedTransactionHasChild(ctx, transaction.ParentTransaction)
+	if err != nil {
+		span.RecordError(err)
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"transaction_id": transaction.TransactionID,
+			"parent":         transaction.ParentTransaction,
+			"reason":         "applied_check_failed",
+		}).Warn("Skipping transaction coalescing")
+		return false, nil
+	}
+	if applied {
+		logrus.WithFields(logrus.Fields{
+			"transaction_id": transaction.TransactionID,
+			"parent":         transaction.ParentTransaction,
+		}).Info("Queued transaction already applied; skipping coalescing")
+		metrics.TransactionBatchTotal.Add(ctx, 1,
+			otelmetric.WithAttributes(attribute.String("result", "skipped")),
+		)
+		return true, nil
+	}
+
 	batch, scope, err := l.buildQueuedCoalescingBatch(ctx, transaction, batchSize)
 	if err != nil {
 		span.RecordError(err)
@@ -87,6 +115,16 @@ func (l *Blnk) tryRecordQueuedTransactionBatch(ctx context.Context, transaction 
 	}
 
 	if err := l.persistQueuedTransactionBatch(ctx, batch); err != nil {
+		if errors.Is(err, errQueuedBatchLeaderApplied) {
+			logrus.WithFields(logrus.Fields{
+				"transaction_id": transaction.TransactionID,
+				"parent":         transaction.ParentTransaction,
+			}).Info("Queued transaction already applied; skipping coalescing")
+			metrics.TransactionBatchTotal.Add(ctx, 1,
+				otelmetric.WithAttributes(attribute.String("result", "skipped")),
+			)
+			return true, nil
+		}
 		span.RecordError(err)
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"transaction_id": transaction.TransactionID,
@@ -178,6 +216,18 @@ func validateQueuedBatchCurrencies(transactions []*model.Transaction) error {
 // balance set and persists the final balance and transaction state atomically.
 func (l *Blnk) persistQueuedTransactionBatchLocked(ctx context.Context, span trace.Span, locker *redlock.MultiLocker, balanceIDs []string, transactions []*model.Transaction) (queuedBatchPersistResult, error) {
 	defer l.releaseLock(ctx, locker)
+
+	// The applied check before the lock can race with another worker's batch on the same
+	// balances, which holds this lock until it commits, so check the leader again now.
+	if leader := transactions[0]; leader.ParentTransaction != "" {
+		applied, err := l.datasource.QueuedTransactionHasChild(ctx, leader.ParentTransaction)
+		if err != nil {
+			return queuedBatchPersistResult{}, fmt.Errorf("failed to recheck queued batch leader: %w", err)
+		}
+		if applied {
+			return queuedBatchPersistResult{}, errQueuedBatchLeaderApplied
+		}
+	}
 
 	balancesByID, orderedBalances, err := l.loadBalancesForQueuedBatch(ctx, balanceIDs)
 	if err != nil {
@@ -504,15 +554,11 @@ func (l *Blnk) validateQueuedBatchTransactionReference(ctx context.Context, tran
 	}
 
 	if _, ok := batchReferences[transaction.Reference]; ok {
-		err := fmt.Errorf("reference %s has already been used", transaction.Reference)
-		notification.NotifyError(err)
-		return err
+		return fmt.Errorf("reference %s has already been used", transaction.Reference)
 	}
 
 	if _, ok := existingReferences[transaction.Reference]; ok {
-		err := fmt.Errorf("reference %s has already been used", transaction.Reference)
-		notification.NotifyError(err)
-		return err
+		return fmt.Errorf("reference %s has already been used", transaction.Reference)
 	}
 
 	if len(prefetchedReferences) == 0 {

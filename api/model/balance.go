@@ -23,13 +23,17 @@ type CreateBalance struct {
 	MetaData           map[string]interface{} `json:"meta_data"`
 	TrackFundLineage   bool                   `json:"track_fund_lineage"`
 	AllocationStrategy string                 `json:"allocation_strategy"`
+	Indicator          string                 `json:"indicator,omitempty"`
 }
 
 type CreateBalanceMonitor struct {
-	BalanceId   string                 `json:"balance_id"`
-	Condition   MonitorCondition       `json:"condition"`
-	CallBackURL string                 `json:"call_back_url"`
-	MetaData    map[string]interface{} `json:"meta_data"`
+	BalanceId   string           `json:"balance_id"`
+	Condition   MonitorCondition `json:"condition"`
+	CallBackURL string           `json:"call_back_url"`
+	Description string           `json:"description"`
+	// Trigger is "edge" (default) or "level". Edge alerts once when the
+	// condition becomes true; level alerts on every transaction while it holds.
+	Trigger string `json:"trigger"`
 }
 
 type MonitorCondition struct {

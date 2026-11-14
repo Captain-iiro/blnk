@@ -83,7 +83,10 @@ func compare(value *big.Int, condition string, compareTo *big.Int) bool {
 		return cmp <= 0
 	case "!=":
 		return cmp != 0
-	case "==":
+	// The table's check constraint stores equality as '=', so that is the
+	// spelling monitors actually carry; '==' is accepted as well because the
+	// API has always advertised it.
+	case "=", "==":
 		return cmp == 0
 	}
 	return false
@@ -304,6 +307,10 @@ func applyPrecisionLogic(transaction *Transaction) *big.Int {
 	}
 
 	transaction.PreciseAmount = convertDecimalToPrecise(transaction)
+	// Always materialize AmountString, including for a precise amount of 0.
+	// The persist path writes AmountString into a numeric column; leaving it
+	// blank makes Postgres reject the insert with invalid input syntax.
+	convertPreciseToDecimal(transaction)
 	return transaction.PreciseAmount
 }
 
@@ -438,8 +445,35 @@ func convertDecimalToPrecise(transaction *Transaction) *big.Int {
 	return result
 }
 
+// MonitorPreciseValue converts a monitor threshold into the minor units the
+// ledger compares against, exactly as transaction amounts are converted:
+// int64(0.29 * 100) truncates to 28. A missing precision means 1, which is how
+// thresholds were compared before monitors had a precision at all.
+func MonitorPreciseValue(value, precision float64) *big.Int {
+	if precision == 0 {
+		precision = 1
+	}
+	return convertDecimalToPrecise(&Transaction{Amount: value, Precision: precision})
+}
+
+// ValidateAmount is the exported ingest check used by QueueTransaction so
+// zero/empty amounts never land on the queue.
+func (transaction *Transaction) ValidateAmount() error {
+	return transaction.validate()
+}
+
 // validate checks if the transaction has a positive amount.
+//
+// Amount is checked first, and unconditionally. PreciseAmount is derived from
+// Amount x Precision and is set on every path that reaches here, so the
+// PreciseAmount branch below always returns early — which left the Amount
+// check unreachable in practice. A negative Amount paired with a negative
+// Precision yields a positive PreciseAmount, so checking only the product
+// silently accepted a transaction whose own recorded amount was negative.
 func (transaction *Transaction) validate() error {
+	if transaction.Amount < 0 {
+		return errors.New("transaction amount must be positive")
+	}
 	if transaction.PreciseAmount != nil {
 		if transaction.PreciseAmount.Sign() <= 0 {
 			return errors.New("transaction precise amount must be positive")

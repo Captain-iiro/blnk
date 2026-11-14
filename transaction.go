@@ -36,7 +36,12 @@ const (
 )
 
 var asyncBulkSemaphore = semaphore.NewWeighted(100) // max 100 concurrent
-var asyncTxnSemaphore = semaphore.NewWeighted(20)   // max 20 concurrent async transaction processors
+
+// queuedSaveSemaphore bounds concurrent saves of queued transactions. Beyond a
+// couple dozen concurrent inserts Postgres write throughput falls rather than
+// rises, and unbounded saves would take the connection pool from every other
+// request.
+var queuedSaveSemaphore = semaphore.NewWeighted(20)
 
 // balanceMonitorSem bounds the number of concurrent balance-monitor checks
 // spawned by post-commit work across all transactions.
@@ -77,6 +82,15 @@ const (
 type transactionExecutionPlan struct {
 	mode        transactionExecutionMode
 	transaction *model.Transaction
+	// viaQueue is true when this plan originated from queued transaction
+	// processing (ProcessQueuedTransaction), as opposed to a direct
+	// RecordTransaction call (e.g. a skip_queue split leg). It controls how a
+	// zero-amount transaction is handled: queued processing must persist a
+	// REJECTED record so a stuck QUEUED parent gets a terminal child instead
+	// of looping forever in recovery, while a direct/split-leg zero-amount
+	// leg (a legitimate rounding remainder, see issue #142/#334) is still
+	// discarded silently without persisting anything.
+	viaQueue bool
 }
 
 type transactionExecutionResult struct {

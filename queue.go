@@ -114,13 +114,16 @@ func (q *Queue) EnqueueInflightAction(ctx context.Context, p InflightActionPaylo
 // Returns:
 // - *Queue: A pointer to the newly created Queue instance.
 func NewQueue(conf *config.Configuration, client *asynq.Client, redisClient redis.UniversalClient) *Queue {
-	redisOption, err := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+	connOpt, err := redis_db.NewConnOpt(conf.Redis.Dns, conf.Redis.SkipTLSVerify, &redis_db.PoolConfig{
+		PoolSize:        conf.Redis.PoolSize,
+		MinIdleConns:    conf.Redis.MinIdleConns,
+		ConnMaxIdleTime: conf.Redis.ConnMaxIdleTime,
+	})
 	if err != nil {
 		logrus.WithError(err).Fatal("failed to parse Redis URL")
 	}
 
-	queueOptions := asynq.RedisClientOpt{Addr: redisOption.Addr, Password: redisOption.Password, DB: redisOption.DB, TLSConfig: redisOption.TLSConfig, PoolSize: conf.Redis.PoolSize}
-	inspector := asynq.NewInspector(queueOptions)
+	inspector := asynq.NewInspector(connOpt)
 	return &Queue{
 		Client:    client,
 		Inspector: inspector,
@@ -219,6 +222,73 @@ func (q *Queue) queueIndexData(id string, collection string, data interface{}) e
 		return err
 	}
 	logrus.WithField("id", id).Debug("successfully enqueued index data")
+	return nil
+}
+
+// queueIndexRefresh enqueues a metadata reindex task that carries only the
+// document ID. The worker re-reads Postgres before upserting so concurrent
+// metadata updates cannot leave Typesense on an older snapshot.
+func (q *Queue) queueIndexRefresh(documentID, collection string) error {
+	if q.config.TypeSense.Dns == "" {
+		return nil
+	}
+
+	taskBody := IndexTask{
+		Collection: collection,
+		DocumentID: documentID,
+		Mode:       IndexModeRefresh,
+	}
+	IPayload, err := json.Marshal(taskBody)
+	if err != nil {
+		return err
+	}
+
+	taskOptions := []asynq.Option{
+		asynq.Queue(q.config.Queue.IndexQueue),
+		asynq.TaskID(fmt.Sprintf("index:refresh:%s:%s", collection, documentID)),
+	}
+	task := asynq.NewTask(q.config.Queue.IndexQueue, IPayload, taskOptions...)
+	if _, err := q.Client.Enqueue(task); err != nil {
+		if errors.Is(err, asynq.ErrTaskIDConflict) {
+			return nil
+		}
+		logrus.WithError(err).WithField("id", documentID).Error("failed to enqueue index refresh")
+		return err
+	}
+	logrus.WithFields(logrus.Fields{"id": documentID, "collection": collection}).Debug("successfully enqueued index refresh")
+	return nil
+}
+
+// queueIndexRefreshScope enqueues a metadata reindex for every transaction row
+// matched by UpdateTransactionMetadata (direct ID or parent_transaction).
+func (q *Queue) queueIndexRefreshScope(scopeID, collection string) error {
+	if q.config.TypeSense.Dns == "" {
+		return nil
+	}
+
+	taskBody := IndexTask{
+		Collection: collection,
+		ScopeID:    scopeID,
+		Mode:       IndexModeRefresh,
+	}
+	IPayload, err := json.Marshal(taskBody)
+	if err != nil {
+		return err
+	}
+
+	taskOptions := []asynq.Option{
+		asynq.Queue(q.config.Queue.IndexQueue),
+		asynq.TaskID(fmt.Sprintf("index:refresh:%s:scope:%s", collection, scopeID)),
+	}
+	task := asynq.NewTask(q.config.Queue.IndexQueue, IPayload, taskOptions...)
+	if _, err := q.Client.Enqueue(task); err != nil {
+		if errors.Is(err, asynq.ErrTaskIDConflict) {
+			return nil
+		}
+		logrus.WithError(err).WithField("scope_id", scopeID).Error("failed to enqueue index refresh scope")
+		return err
+	}
+	logrus.WithFields(logrus.Fields{"scope_id": scopeID, "collection": collection}).Debug("successfully enqueued index refresh scope")
 	return nil
 }
 

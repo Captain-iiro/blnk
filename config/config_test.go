@@ -191,7 +191,7 @@ func TestLoadConfigFromFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
 	}
-	defer os.Remove(tmpFile.Name()) // Clean up after the test
+	defer func() { _ = os.Remove(tmpFile.Name()) }() // Clean up after the test
 
 	// Sample configuration to write to the temp file
 	sampleConfig := Configuration{
@@ -209,11 +209,13 @@ func TestLoadConfigFromFile(t *testing.T) {
 	if err := json.NewEncoder(tmpFile).Encode(sampleConfig); err != nil {
 		t.Fatalf("Unable to write to temporary file: %v", err)
 	}
-	tmpFile.Close() // Close the file so loadConfigFromFile can open it
+	if err := tmpFile.Close(); err != nil { // Close the file so loadConfigFromFile can open it
+		t.Fatalf("Unable to close temporary file: %v", err)
+	}
 
-	// Set an environment variable to override the project name
-	os.Setenv("BLNK_PROJECT_NAME", "Env Project")
-	defer os.Unsetenv("BLNK_PROJECT_NAME") // Clean up after the test
+	// Set an environment variable to override the project name. t.Setenv
+	// restores the previous value when the test ends.
+	t.Setenv("BLNK_PROJECT_NAME", "Env Project")
 
 	// Load the configuration from the file
 	if err := loadConfigFromFile(tmpFile.Name()); err != nil {
@@ -287,7 +289,7 @@ func TestInitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
 	}
-	defer os.Remove(tmpFile.Name()) // Clean up after the test
+	defer func() { _ = os.Remove(tmpFile.Name()) }() // Clean up after the test
 
 	// Sample configuration to write to the temp file
 	sampleConfig := Configuration{
@@ -301,7 +303,9 @@ func TestInitConfig(t *testing.T) {
 	if err := json.NewEncoder(tmpFile).Encode(sampleConfig); err != nil {
 		t.Fatalf("Unable to write to temporary file: %v", err)
 	}
-	tmpFile.Close() // Close the file so InitConfig can open it
+	if err := tmpFile.Close(); err != nil { // Close the file so InitConfig can open it
+		t.Fatalf("Unable to close temporary file: %v", err)
+	}
 
 	// Attempt to initialize the configuration using the temporary file
 	if err := InitConfig(tmpFile.Name()); err != nil {
@@ -373,6 +377,28 @@ func TestTypeSenseBackpressureRetryIntervalDefault(t *testing.T) {
 	}
 	if cnf.TypeSense.BackpressureRetryInterval != 2*time.Second {
 		t.Fatalf("explicit Typesense backpressure retry interval = %v, want 2s", cnf.TypeSense.BackpressureRetryInterval)
+	}
+}
+
+func TestRedisConnMaxIdleTimeDefault(t *testing.T) {
+	cnf := Configuration{
+		ProjectName: "Test Project",
+		DataSource:  DataSourceConfig{Dns: "some-dns"},
+		Redis:       RedisConfig{Dns: "localhost:6379"},
+	}
+	if err := cnf.validateAndAddDefaults(); err != nil {
+		t.Fatalf("validateAndAddDefaults failed: %v", err)
+	}
+	if cnf.Redis.ConnMaxIdleTime != 2*time.Minute {
+		t.Fatalf("default Redis conn max idle time = %v, want 2m", cnf.Redis.ConnMaxIdleTime)
+	}
+
+	cnf.Redis.ConnMaxIdleTime = 45 * time.Second
+	if err := cnf.validateAndAddDefaults(); err != nil {
+		t.Fatalf("validateAndAddDefaults failed: %v", err)
+	}
+	if cnf.Redis.ConnMaxIdleTime != 45*time.Second {
+		t.Fatalf("explicit Redis conn max idle time = %v, want 45s", cnf.Redis.ConnMaxIdleTime)
 	}
 }
 

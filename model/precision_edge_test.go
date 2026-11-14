@@ -135,6 +135,20 @@ func TestApplyPrecision_EdgeCases(t *testing.T) {
 		assert.Equal(t, "42", got.String())
 	})
 
+	t.Run("zero precise amount fills AmountString", func(t *testing.T) {
+		txn := &Transaction{PreciseAmount: big.NewInt(0), Amount: 0, Precision: 100}
+		got := ApplyPrecision(txn)
+		assert.Equal(t, "0", got.String())
+		assert.Equal(t, "0", txn.AmountString)
+	})
+
+	t.Run("amount-only conversion fills AmountString in one pass", func(t *testing.T) {
+		txn := &Transaction{Amount: 10, Precision: 100}
+		got := ApplyPrecision(txn)
+		assert.Equal(t, "1000", got.String())
+		assert.Equal(t, "10", txn.AmountString)
+	})
+
 	t.Run("existing positive precise amount drives the decimal amount", func(t *testing.T) {
 		txn := &Transaction{PreciseAmount: big.NewInt(1001), Precision: 100}
 		got := ApplyPrecision(txn)
@@ -433,6 +447,28 @@ func TestCalculateDistributionsPrecise_AdversarialInputs(t *testing.T) {
 		assert.Equal(t, "1", got["a"].String())
 		assert.Equal(t, "0", got["b"].String())
 	})
+
+	// A negative share is added back to "left": 100 split as [-50, "left"]
+	// gave "left" 150. ["150%", "-50%"] sums to 100% and slipped past the
+	// total check the same way.
+	for _, tc := range []struct {
+		name string
+		dist Distribution
+	}{
+		{"negative fixed amount rejected", Distribution{Identifier: "a", Distribution: "-50"}},
+		{"negative precise amount rejected", Distribution{Identifier: "a", PreciseDistribution: "-5000"}},
+		{"negative percentage rejected", Distribution{Identifier: "a", Distribution: "-50%"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CalculateDistributionsPrecise(ctx, big.NewInt(10000), []Distribution{
+				{Identifier: "b", Distribution: "150%"},
+				tc.dist,
+				{Identifier: "c", Distribution: "left"},
+			}, 100)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cannot be negative")
+		})
+	}
 
 	t.Run("invalid percentage format rejected", func(t *testing.T) {
 		_, err := CalculateDistributionsPrecise(ctx, big.NewInt(10000), []Distribution{

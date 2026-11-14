@@ -69,6 +69,9 @@ func (m *MockDataSource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context
 
 func (m *MockDataSource) GetTransaction(ctx context.Context, id string) (*model.Transaction, error) {
 	args := m.Called(ctx, id)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
 	return args.Get(0).(*model.Transaction), args.Error(1)
 }
 
@@ -171,6 +174,11 @@ func (m *MockDataSource) GetQueuedTransactionsForCoalescing(ctx context.Context,
 	return args.Get(0).([]*model.Transaction), args.Error(1)
 }
 
+func (m *MockDataSource) QueuedTransactionHasChild(ctx context.Context, transactionID string) (bool, error) {
+	args := m.Called(ctx, transactionID)
+	return args.Bool(0), args.Error(1)
+}
+
 func (m *MockDataSource) GetQueuedTransactionsForSourceCoalescing(ctx context.Context, source, currency, excludeTransactionID string, createdAtOrAfter time.Time, limit int) ([]*model.Transaction, error) {
 	args := m.Called(ctx, source, currency, excludeTransactionID, createdAtOrAfter, limit)
 	if args.Get(0) == nil {
@@ -235,9 +243,15 @@ func (m *MockDataSource) UpdateLedger(id, name string) (*model.Ledger, error) {
 }
 
 // Metadata update methods
-func (m *MockDataSource) UpdateLedgerMetadata(id string, metadata map[string]interface{}) error {
+func (m *MockDataSource) UpdateLedgerMetadata(id string, metadata map[string]interface{}) (map[string]interface{}, error) {
 	args := m.Called(id, metadata)
-	return args.Error(0)
+	if fn, ok := args.Get(0).(func(string, map[string]interface{}) (map[string]interface{}, error)); ok {
+		return fn(id, metadata)
+	}
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]interface{}), args.Error(1)
 }
 
 func (m *MockDataSource) UpdateTransactionMetadata(ctx context.Context, id string, metadata map[string]interface{}) error {
@@ -245,14 +259,28 @@ func (m *MockDataSource) UpdateTransactionMetadata(ctx context.Context, id strin
 	return args.Error(0)
 }
 
+func (m *MockDataSource) ListTransactionsByMetadataScope(ctx context.Context, scopeID string, limit int, offset int64) ([]*model.Transaction, error) {
+	args := m.Called(ctx, scopeID, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*model.Transaction), args.Error(1)
+}
+
 func (m *MockDataSource) UpdateBalanceMetadata(ctx context.Context, id string, metadata map[string]interface{}) error {
 	args := m.Called(ctx, id, metadata)
 	return args.Error(0)
 }
 
-func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]interface{}) error {
+func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]interface{}) (map[string]interface{}, error) {
 	args := m.Called(id, metadata)
-	return args.Error(0)
+	if fn, ok := args.Get(0).(func(string, map[string]interface{}) (map[string]interface{}, error)); ok {
+		return fn(id, metadata)
+	}
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]interface{}), args.Error(1)
 }
 
 // Balance methods
@@ -411,6 +439,16 @@ func (m *MockDataSource) UpdateMonitor(monitor *model.BalanceMonitor) error {
 
 func (m *MockDataSource) DeleteMonitor(id string) error {
 	args := m.Called(id)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) TransitionMonitorState(ctx context.Context, monitorID, balanceID string, conditionMet bool, balanceVersion int64) (bool, error) {
+	args := m.Called(ctx, monitorID, balanceID, conditionMet, balanceVersion)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *MockDataSource) ReleaseMonitorState(ctx context.Context, monitorID, balanceID string, balanceVersion int64) error {
+	args := m.Called(ctx, monitorID, balanceID, balanceVersion)
 	return args.Error(0)
 }
 
@@ -669,6 +707,14 @@ func (m *MockDataSource) GetOutboxByTransactionID(ctx context.Context, transacti
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*model.LineageOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) GetPendingShadowCommitOutbox(ctx context.Context, parentTransactionID string) ([]model.LineageOutbox, error) {
+	args := m.Called(ctx, parentTransactionID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.LineageOutbox), args.Error(1)
 }
 
 func (m *MockDataSource) HasPendingCreditOutbox(ctx context.Context, balanceID string) (bool, error) {

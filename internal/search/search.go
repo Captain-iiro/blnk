@@ -35,6 +35,7 @@ const (
 	CollectionTransactions    = "transactions"
 	CollectionReconciliations = "reconciliations"
 	CollectionIdentities      = "identities"
+	DefaultTimeout            = 5 * time.Second
 )
 
 // CollectionConfig holds configuration for a specific collection.
@@ -158,11 +159,11 @@ func (b *IndexBatch) Deduplicate() {
 }
 
 // NewTypesenseClient initializes and returns a new Typesense client instance.
-func NewTypesenseClient(apiKey string, hosts []string) *TypesenseClient {
+func NewTypesenseClient(apiKey string, hosts []string, requestTimeout time.Duration) *TypesenseClient {
 	client := typesense.NewClient(
 		typesense.WithServer(hosts[0]),
 		typesense.WithAPIKey(apiKey),
-		typesense.WithConnectionTimeout(5*time.Second),
+		typesense.WithConnectionTimeout(requestTimeout),
 		typesense.WithCircuitBreakerMaxRequests(50),
 		typesense.WithCircuitBreakerInterval(2*time.Minute),
 		typesense.WithCircuitBreakerTimeout(1*time.Minute),
@@ -224,6 +225,20 @@ type MultiSearchRequest struct {
 // Remove the incorrect MultiSearch method and replace with this:
 func (t *TypesenseClient) MultiSearch(ctx context.Context, searchRequests api.MultiSearchSearchesParameter) (*api.MultiSearchResult, error) {
 	return t.Client.MultiSearch.Perform(ctx, &api.MultiSearchParams{}, searchRequests)
+}
+
+// NormalizeTransactionDocument applies the same field normalization as a
+// transactions upsert (metadata coercion, bigint strings, required defaults,
+// time fields) without writing to Typesense. Used by tests to verify reindex
+// payloads retain indexed fields.
+func NormalizeTransactionDocument(data map[string]interface{}) map[string]interface{} {
+	config := collectionConfigs[CollectionTransactions]
+	tc := &TypesenseClient{}
+	_ = tc.processMetadata(data)
+	tc.convertLargeNumbers(config, data)
+	tc.ensureSchemaFields(config, data)
+	tc.normalizeTimeFields(config, data)
+	return data
 }
 
 // HandleNotification processes incoming notifications and updates Typesense collections based on the table and data.
@@ -600,6 +615,7 @@ func getTransactionSchema() *api.CollectionSchema {
 			{Name: "inflight_expiry_date", Type: "int64", Facet: &facet},
 			{Name: "effective_date", Type: "int64", Facet: &facet},
 			{Name: "meta_data", Type: "object", Facet: &facet, Optional: &enableNested},
+			{Name: "meta_data.QUEUED_PARENT_TRANSACTION", Type: "string", Facet: &facet, Optional: &enableNested},
 		},
 		DefaultSortingField: &sortBy,
 		EnableNestedFields:  &enableNested,

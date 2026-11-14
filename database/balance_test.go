@@ -117,6 +117,38 @@ func TestCreateBalance_UniqueViolation(t *testing.T) {
 	assert.Equal(t, apierror.ErrConflict, apiErr.Code)
 }
 
+func TestCreateBalance_DuplicateIndicatorCurrency(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	balance := model.Balance{
+		Balance:       big.NewInt(0),
+		CreditBalance: big.NewInt(0),
+		DebitBalance:  big.NewInt(0),
+		Currency:      "USD",
+		LedgerID:      "general_ledger_id",
+		Indicator:     "@cash",
+	}
+
+	metaDataJSON, err := json.Marshal(balance.MetaData)
+	assert.NoError(t, err)
+
+	mock.ExpectExec("INSERT INTO blnk.balances").
+		WithArgs(sqlmock.AnyArg(), balance.Balance.String(), balance.CreditBalance.String(), balance.DebitBalance.String(), balance.Currency, balance.LedgerID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), metaDataJSON, false, "FIFO").
+		WillReturnError(&pq.Error{Code: "23505", Message: `duplicate key value violates unique constraint "unique_indicator_currency"`})
+
+	_, err = ds.CreateBalance(balance)
+	assert.Error(t, err, "a duplicate (indicator, currency) pair must surface as a real error, not a silent empty balance")
+
+	apiErr, ok := err.(apierror.APIError)
+	assert.True(t, ok)
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code)
+	assert.Contains(t, apiErr.Message, "@cash")
+}
+
 func TestGetBalanceByID_Success(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -216,8 +248,8 @@ func TestUpdateBalances_Success(t *testing.T) {
 	// Expect source balance update
 	mock.ExpectExec(regexp.QuoteMeta(`
         UPDATE blnk.balances
-        SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, currency = $8, ledger_id = $9, created_at = $10, version = version + 1
-        WHERE balance_id = $1 AND version = $11
+        SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, ledger_id = $8, created_at = $9, version = version + 1
+        WHERE balance_id = $1 AND version = $10
     `)).WithArgs(
 		sourceBalance.BalanceID,
 		sourceBalance.Balance.String(),
@@ -226,7 +258,6 @@ func TestUpdateBalances_Success(t *testing.T) {
 		sourceBalance.InflightBalance.String(),
 		sourceBalance.InflightCreditBalance.String(),
 		sourceBalance.InflightDebitBalance.String(),
-		sourceBalance.Currency,
 		sourceBalance.LedgerID,
 		sourceBalance.CreatedAt,
 		sourceBalance.Version,
@@ -235,8 +266,8 @@ func TestUpdateBalances_Success(t *testing.T) {
 	// Expect destination balance update
 	mock.ExpectExec(regexp.QuoteMeta(`
         UPDATE blnk.balances
-        SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, currency = $8, ledger_id = $9, created_at = $10, version = version + 1
-        WHERE balance_id = $1 AND version = $11
+        SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, ledger_id = $8, created_at = $9, version = version + 1
+        WHERE balance_id = $1 AND version = $10
     `)).WithArgs(
 		destBalance.BalanceID,
 		destBalance.Balance.String(),
@@ -245,7 +276,6 @@ func TestUpdateBalances_Success(t *testing.T) {
 		destBalance.InflightBalance.String(),
 		destBalance.InflightCreditBalance.String(),
 		destBalance.InflightDebitBalance.String(),
-		destBalance.Currency,
 		destBalance.LedgerID,
 		destBalance.CreatedAt,
 		destBalance.Version,
@@ -302,7 +332,6 @@ func TestUpdateBalances_SourceUpdateError(t *testing.T) {
 			"0",              // InflightBalance string
 			"0",              // InflightCreditBalance string
 			"0",              // InflightDebitBalance string
-			"",               // Currency
 			"",               // LedgerID
 			sqlmock.AnyArg(), // CreatedAt
 			sourceBalance.Version,
@@ -342,7 +371,6 @@ func TestUpdateBalances_DestUpdateError(t *testing.T) {
 			"0",              // InflightBalance string
 			"0",              // InflightCreditBalance string
 			"0",              // InflightDebitBalance string
-			"",               // Currency
 			"",               // LedgerID
 			sqlmock.AnyArg(), // CreatedAt
 			sourceBalance.Version,
@@ -359,7 +387,6 @@ func TestUpdateBalances_DestUpdateError(t *testing.T) {
 			"0",              // InflightBalance string
 			"0",              // InflightCreditBalance string
 			"0",              // InflightDebitBalance string
-			"",               // Currency
 			"",               // LedgerID
 			sqlmock.AnyArg(), // CreatedAt
 			destBalance.Version,
@@ -399,7 +426,6 @@ func TestUpdateBalances_CommitError(t *testing.T) {
 			"0",              // InflightBalance string
 			"0",              // InflightCreditBalance string
 			"0",              // InflightDebitBalance string
-			"",               // Currency
 			"",               // LedgerID
 			sqlmock.AnyArg(), // CreatedAt
 			sourceBalance.Version,
@@ -416,7 +442,6 @@ func TestUpdateBalances_CommitError(t *testing.T) {
 			"0",              // InflightBalance string
 			"0",              // InflightCreditBalance string
 			"0",              // InflightDebitBalance string
-			"",               // Currency
 			"",               // LedgerID
 			sqlmock.AnyArg(), // CreatedAt
 			destBalance.Version,
@@ -650,10 +675,13 @@ func TestGetBalanceByIDLite_Success(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id
+       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id, meta_data
        FROM blnk.balances
        WHERE balance_id = $1
     `
+
+	metaDataJSON, err := json.Marshal(map[string]interface{}{"field": "test_value"})
+	assert.NoError(t, err)
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WithArgs("bln_123").
@@ -661,12 +689,12 @@ func TestGetBalanceByIDLite_Success(t *testing.T) {
 			"balance_id", "indicator", "currency", "ledger_id",
 			"balance", "credit_balance", "debit_balance",
 			"inflight_balance", "inflight_credit_balance", "inflight_debit_balance",
-			"created_at", "version", "track_fund_lineage", "allocation_strategy", "identity_id",
+			"created_at", "version", "track_fund_lineage", "allocation_strategy", "identity_id", "meta_data",
 		}).AddRow(
 			"bln_123", "ACC001", "USD", "ldg_001",
 			"100000", "60000", "40000",
 			"5000", "3000", "2000",
-			time.Now(), 1, false, "FIFO", "",
+			time.Now(), 1, false, "FIFO", "", metaDataJSON,
 		))
 
 	balance, err := ds.GetBalanceByIDLite("bln_123")
@@ -679,6 +707,46 @@ func TestGetBalanceByIDLite_Success(t *testing.T) {
 	assert.Equal(t, "60000", balance.CreditBalance.String())
 	assert.Equal(t, "40000", balance.DebitBalance.String())
 	assert.Equal(t, "5000", balance.InflightBalance.String())
+	// Regression test for #256: meta_data must be populated from the query,
+	// not silently dropped, since callers persist this struct back to the
+	// search index and would otherwise overwrite existing metadata with nil.
+	assert.Equal(t, "test_value", balance.MetaData["field"])
+
+	err = mock.ExpectationsWereMet()
+	assert.NoError(t, err)
+}
+
+func TestGetBalanceByIDLite_NilMetaData(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	query := `
+       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id, meta_data
+       FROM blnk.balances
+       WHERE balance_id = $1
+    `
+
+	mock.ExpectQuery(regexp.QuoteMeta(query)).
+		WithArgs("bln_123").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"balance_id", "indicator", "currency", "ledger_id",
+			"balance", "credit_balance", "debit_balance",
+			"inflight_balance", "inflight_credit_balance", "inflight_debit_balance",
+			"created_at", "version", "track_fund_lineage", "allocation_strategy", "identity_id", "meta_data",
+		}).AddRow(
+			"bln_123", "ACC001", "USD", "ldg_001",
+			"100000", "60000", "40000",
+			"5000", "3000", "2000",
+			time.Now(), 1, false, "FIFO", "", nil,
+		))
+
+	balance, err := ds.GetBalanceByIDLite("bln_123")
+	assert.NoError(t, err)
+	assert.NotNil(t, balance)
+	assert.Nil(t, balance.MetaData)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -692,7 +760,7 @@ func TestGetBalanceByIDLite_NotFound(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id
+       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id, meta_data
        FROM blnk.balances
        WHERE balance_id = $1
     `
@@ -706,7 +774,7 @@ func TestGetBalanceByIDLite_NotFound(t *testing.T) {
 	assert.Nil(t, balance)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -720,7 +788,7 @@ func TestGetBalanceByIDLite_NullIndicator(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id
+       SELECT balance_id, indicator, currency, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version, track_fund_lineage, COALESCE(allocation_strategy, 'FIFO') as allocation_strategy, COALESCE(identity_id, '') as identity_id, meta_data
        FROM blnk.balances
        WHERE balance_id = $1
     `
@@ -731,12 +799,12 @@ func TestGetBalanceByIDLite_NullIndicator(t *testing.T) {
 			"balance_id", "indicator", "currency", "ledger_id",
 			"balance", "credit_balance", "debit_balance",
 			"inflight_balance", "inflight_credit_balance", "inflight_debit_balance",
-			"created_at", "version", "track_fund_lineage", "allocation_strategy", "identity_id",
+			"created_at", "version", "track_fund_lineage", "allocation_strategy", "identity_id", "meta_data",
 		}).AddRow(
 			"bln_123", nil, "USD", "ldg_001",
 			"100000", "60000", "40000",
 			"5000", "3000", "2000",
-			time.Now(), 1, false, "FIFO", "",
+			time.Now(), 1, false, "FIFO", "", nil,
 		))
 
 	balance, err := ds.GetBalanceByIDLite("bln_123")
@@ -1073,10 +1141,10 @@ func TestCreateMonitor_Success(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`
-		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at, trigger_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`)).
-		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Condition.Precision, monitor.Condition.PreciseValue.String(), monitor.Description, monitor.CallBackURL, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Condition.Precision, monitor.Condition.PreciseValue.String(), monitor.Description, monitor.CallBackURL, sqlmock.AnyArg(), model.TriggerEdge).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	createdMonitor, err := ds.CreateMonitor(monitor)
@@ -1106,10 +1174,10 @@ func TestCreateMonitor_UniqueViolation(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`
-		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at, trigger_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`)).
-		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), model.TriggerEdge).
 		WillReturnError(&pq.Error{Code: "23505", Message: "unique_violation"})
 
 	_, err = ds.CreateMonitor(monitor)
@@ -1139,10 +1207,10 @@ func TestCreateMonitor_ForeignKeyViolation(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`
-		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO blnk.balance_monitors (monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at, trigger_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`)).
-		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), model.TriggerEdge).
 		WillReturnError(&pq.Error{Code: "23503", Message: "foreign_key_violation"})
 
 	_, err = ds.CreateMonitor(monitor)
@@ -1163,16 +1231,16 @@ func TestGetMonitorByID_Success(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at
+		SELECT monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at, trigger_type, condition_state
 		FROM blnk.balance_monitors WHERE monitor_id = $1
 	`
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WithArgs("mon_123").
 		WillReturnRows(sqlmock.NewRows([]string{
-			"monitor_id", "balance_id", "field", "operator", "value", "precision", "precise_value", "description", "call_back_url", "created_at",
+			"monitor_id", "balance_id", "field", "operator", "value", "precision", "precise_value", "description", "call_back_url", "created_at", "trigger_type", "condition_state",
 		}).AddRow(
-			"mon_123", "bln_123", "balance", "<", 1000.0, 100, int64(100000), "Low balance alert", "https://example.com/webhook", time.Now(),
+			"mon_123", "bln_123", "balance", "<", 1000.0, 100, int64(100000), "Low balance alert", "https://example.com/webhook", time.Now(), model.TriggerEdge, false,
 		))
 
 	monitor, err := ds.GetMonitorByID("mon_123")
@@ -1196,7 +1264,7 @@ func TestGetMonitorByID_NotFound(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at
+		SELECT monitor_id, balance_id, field, operator, value, precision, precise_value, description, call_back_url, created_at, trigger_type, condition_state
 		FROM blnk.balance_monitors WHERE monitor_id = $1
 	`
 
@@ -1209,7 +1277,7 @@ func TestGetMonitorByID_NotFound(t *testing.T) {
 	assert.Nil(t, monitor)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalMonitorNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1223,16 +1291,16 @@ func TestGetAllMonitors_Success(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at
+		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value, trigger_type, condition_state
 		FROM blnk.balance_monitors
 	`
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at",
+			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "precision", "precise_value", "trigger_type", "condition_state",
 		}).
-			AddRow("mon_1", "bln_1", "balance", "<", 1000.0, "Alert 1", "https://example.com/1", time.Now()).
-			AddRow("mon_2", "bln_2", "credit_balance", ">", 5000.0, "Alert 2", "https://example.com/2", time.Now()))
+			AddRow("mon_1", "bln_1", "balance", "<", 1000.0, "Alert 1", "https://example.com/1", time.Now(), 100, int64(100000), model.TriggerEdge, false).
+			AddRow("mon_2", "bln_2", "credit_balance", ">", 5000.0, "Alert 2", "https://example.com/2", time.Now(), 100, int64(500000), model.TriggerLevel, true))
 
 	monitors, err := ds.GetAllMonitors()
 	assert.NoError(t, err)
@@ -1252,13 +1320,13 @@ func TestGetAllMonitors_Empty(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at
+		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value, trigger_type, condition_state
 		FROM blnk.balance_monitors
 	`
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at",
+			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "trigger_type", "condition_state", "precision", "precise_value",
 		}))
 
 	monitors, err := ds.GetAllMonitors()
@@ -1277,17 +1345,17 @@ func TestGetBalanceMonitors_Success(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value
+		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value, trigger_type, condition_state
 		FROM blnk.balance_monitors WHERE balance_id = $1
 	`
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WithArgs("bln_123").
 		WillReturnRows(sqlmock.NewRows([]string{
-			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "precision", "precise_value",
+			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "precision", "precise_value", "trigger_type", "condition_state",
 		}).
-			AddRow("mon_1", "bln_123", "balance", "<", 1000.0, "Low alert", "https://example.com/1", time.Now(), 100, int64(100000)).
-			AddRow("mon_2", "bln_123", "debit_balance", ">", 500.0, "High debit", "https://example.com/2", time.Now(), 100, int64(50000)))
+			AddRow("mon_1", "bln_123", "balance", "<", 1000.0, "Low alert", "https://example.com/1", time.Now(), 100, int64(100000), model.TriggerEdge, false).
+			AddRow("mon_2", "bln_123", "debit_balance", ">", 500.0, "High debit", "https://example.com/2", time.Now(), 100, int64(50000), model.TriggerLevel, true))
 
 	monitors, err := ds.GetBalanceMonitors("bln_123")
 	assert.NoError(t, err)
@@ -1308,14 +1376,14 @@ func TestGetBalanceMonitors_Empty(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	query := `
-		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value
+		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url, created_at, precision, precise_value, trigger_type, condition_state
 		FROM blnk.balance_monitors WHERE balance_id = $1
 	`
 
 	mock.ExpectQuery(regexp.QuoteMeta(query)).
 		WithArgs("bln_no_monitors").
 		WillReturnRows(sqlmock.NewRows([]string{
-			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "precision", "precise_value",
+			"monitor_id", "balance_id", "field", "operator", "value", "description", "call_back_url", "created_at", "precision", "precise_value", "trigger_type", "condition_state",
 		}))
 
 	monitors, err := ds.GetBalanceMonitors("bln_no_monitors")
@@ -1345,14 +1413,8 @@ func TestUpdateMonitor_Success(t *testing.T) {
 		},
 	}
 
-	query := `
-		UPDATE blnk.balance_monitors
-		SET balance_id = $2, field = $3, operator = $4, value = $5, description = $6, call_back_url = $7
-		WHERE monitor_id = $1
-	`
-
-	mock.ExpectExec(regexp.QuoteMeta(query)).
-		WithArgs(monitor.MonitorID, monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Description, monitor.CallBackURL).
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.balance_monitors AS m")).
+		WithArgs(monitor.MonitorID, monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Description, float64(0), "2000", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err = ds.UpdateMonitor(monitor)
@@ -1380,21 +1442,15 @@ func TestUpdateMonitor_NotFound(t *testing.T) {
 		},
 	}
 
-	query := `
-		UPDATE blnk.balance_monitors
-		SET balance_id = $2, field = $3, operator = $4, value = $5, description = $6, call_back_url = $7
-		WHERE monitor_id = $1
-	`
-
-	mock.ExpectExec(regexp.QuoteMeta(query)).
-		WithArgs(monitor.MonitorID, monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Description, monitor.CallBackURL).
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.balance_monitors AS m")).
+		WithArgs(monitor.MonitorID, monitor.BalanceID, monitor.Condition.Field, monitor.Condition.Operator, monitor.Condition.Value, monitor.Description, float64(0), "2000", "").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	err = ds.UpdateMonitor(monitor)
 	assert.Error(t, err)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalMonitorNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1441,7 +1497,7 @@ func TestDeleteMonitor_NotFound(t *testing.T) {
 	assert.Error(t, err)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalMonitorNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1536,7 +1592,7 @@ func TestUpdateBalance_NotFound(t *testing.T) {
 	assert.Error(t, err)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1636,7 +1692,7 @@ func TestUpdateBalanceIdentity_NotFound(t *testing.T) {
 	assert.Error(t, err)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1744,7 +1800,7 @@ func TestGetBalanceAtTime_BalanceNotFound(t *testing.T) {
 	assert.Nil(t, balance)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code)
+	assert.Equal(t, apierror.ErrBalNotFound, apiErr.Code)
 
 	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
@@ -1829,7 +1885,12 @@ func TestGetMostRecentSnapshot_Found(t *testing.T) {
 	assert.NotNil(t, debitBalance)
 	assert.Equal(t, big.NewInt(500), creditBalance)
 	assert.Equal(t, big.NewInt(500), debitBalance)
-	assert.Equal(t, snapshotTime, resultTime)
+	// The bound is an instant, and it is returned normalised to UTC so it can
+	// be compared against the UTC wall clocks in blnk.transactions. Equal
+	// compares the instant; assert.Equal would compare the zone too.
+	assert.True(t, snapshotTime.Equal(resultTime),
+		"expected the same instant as %s, got %s", snapshotTime, resultTime)
+	assert.Equal(t, time.UTC, resultTime.Location())
 }
 
 func TestGetMostRecentSnapshot_NotFound(t *testing.T) {

@@ -62,6 +62,30 @@ func (l *Blnk) RefundWorker(ctx context.Context, jobs <-chan *model.Transaction,
 // processing for time-sensitive refunds.
 //
 // RefundWorker is left unchanged; this is purely additive.
+// RefundWorkerWithRefundOptions returns a transactionWorker that refunds each
+// job using the supplied options, so a caller can set the reversal's
+// description and metadata as well as its queueing.
+//
+// RefundWorkerWithOptions is the same worker with only SkipQueue set.
+func (l *Blnk) RefundWorkerWithRefundOptions(opts RefundOptions) transactionWorker {
+	return func(ctx context.Context, jobs <-chan *model.Transaction, results chan<- BatchJobResult, wg *sync.WaitGroup, amount *big.Int) {
+		ctx, span := tracer.Start(ctx, "RefundWorkerWithRefundOptions")
+		defer span.End()
+
+		defer wg.Done()
+		for originalTxn := range jobs {
+			queuedRefundTxn, err := l.RefundTransactionWithOptions(ctx, originalTxn.TransactionID, opts)
+			if err != nil {
+				results <- BatchJobResult{Error: err}
+				span.RecordError(err)
+				continue
+			}
+			results <- BatchJobResult{Txn: queuedRefundTxn}
+			span.AddEvent("Refund processed", trace.WithAttributes(attribute.String("transaction.id", queuedRefundTxn.TransactionID)))
+		}
+	}
+}
+
 func (l *Blnk) RefundWorkerWithOptions(skipQueue bool) transactionWorker {
 	return func(ctx context.Context, jobs <-chan *model.Transaction, results chan<- BatchJobResult, wg *sync.WaitGroup, amount *big.Int) {
 		ctx, span := tracer.Start(ctx, "RefundWorkerWithOptions")
@@ -98,10 +122,10 @@ func (l *Blnk) getOriginalTransactionForRefund(ctx context.Context, transactionI
 			if queueErr != nil {
 				span.RecordError(queueErr)
 				// Return the original DB error if queue retrieval also fails
-				return nil, fmt.Errorf("transaction %s not found in DB or queue: %w", transactionID, err)
+				return nil, fmt.Errorf("transaction %s not found: %w", transactionID, err)
 			}
 			if queuedTxn == nil {
-				err := fmt.Errorf("transaction %s not found in DB or queue", transactionID)
+				err := fmt.Errorf("transaction %s not found", transactionID)
 				span.RecordError(err)
 				return nil, err
 			}
@@ -140,7 +164,7 @@ func (l *Blnk) validateTransactionForRefund(ctx context.Context, originalTxn *mo
 		return fmt.Errorf("failed to check if transaction %s was already refunded: %w", originalTxn.TransactionID, err)
 	}
 	if isRefunded {
-		err := fmt.Errorf("transaction %s has already been refunded", originalTxn.TransactionID)
+		err := &errTransactionAlreadyRefunded{transactionID: originalTxn.TransactionID}
 		span.RecordError(err)
 		return err
 	}
@@ -149,16 +173,56 @@ func (l *Blnk) validateTransactionForRefund(ctx context.Context, originalTxn *mo
 	return nil
 }
 
+// RefundOptions carries the caller-supplied settings for a refund.
+//
+// The zero value reproduces the historical behaviour: queued asynchronously,
+// with the reversal inheriting the original transaction's description and
+// metadata.
+type RefundOptions struct {
+	// SkipQueue processes the refund synchronously instead of placing it on
+	// the transaction queue.
+	SkipQueue bool
+
+	// Description replaces the reversal's description, which otherwise copies
+	// the original transaction's.
+	Description string
+
+	// MetaData is merged onto the metadata inherited from the original
+	// transaction, with these keys winning on conflict. Merging rather than
+	// replacing keeps the keys the ledger itself sets on the original — such
+	// as inflight, atomic and allow_overdraft — which downstream processing
+	// reads.
+	MetaData map[string]interface{}
+}
+
 // prepareRefundTransaction creates and configures a new transaction object for the refund.
-func prepareRefundTransaction(originalTxn *model.Transaction, skipQueue bool) *model.Transaction {
+func prepareRefundTransaction(originalTxn *model.Transaction, opts RefundOptions) *model.Transaction {
 	newTransaction := *originalTxn // Create a copy
 	newTransaction.TransactionID = model.GenerateUUIDWithSuffix("txn")
-	newTransaction.Reference = fmt.Sprintf("%s_refund", originalTxn.TransactionID)
+	newTransaction.Reference = model.RefundReference(originalTxn.TransactionID)
 	newTransaction.ParentTransaction = originalTxn.TransactionID
 	newTransaction.Source = originalTxn.Destination // Swap source and destination
 	newTransaction.Destination = originalTxn.Source
 	newTransaction.AllowOverdraft = true
-	newTransaction.SkipQueue = skipQueue
+	newTransaction.SkipQueue = opts.SkipQueue
+
+	if opts.Description != "" {
+		newTransaction.Description = opts.Description
+	}
+
+	if len(opts.MetaData) > 0 {
+		// Build a new map rather than writing into the inherited one: the copy
+		// above shares the original transaction's metadata map, so mutating it
+		// here would also rewrite the transaction being refunded.
+		merged := make(map[string]interface{}, len(originalTxn.MetaData)+len(opts.MetaData))
+		for k, v := range originalTxn.MetaData {
+			merged[k] = v
+		}
+		for k, v := range opts.MetaData {
+			merged[k] = v
+		}
+		newTransaction.MetaData = merged
+	}
 
 	// Adjust status based on original status for proper processing
 	if originalTxn.Status == StatusVoid {
@@ -184,6 +248,15 @@ func prepareRefundTransaction(originalTxn *model.Transaction, skipQueue bool) *m
 // - *model.Transaction: A pointer to the refunded Transaction model.
 // - error: An error if the transaction could not be refunded.
 func (l *Blnk) RefundTransaction(ctx context.Context, transactionID string, skipQueue bool) (*model.Transaction, error) {
+	return l.RefundTransactionWithOptions(ctx, transactionID, RefundOptions{SkipQueue: skipQueue})
+}
+
+// RefundTransactionWithOptions refunds a transaction, letting the caller set
+// the reversal's description and metadata rather than inheriting the
+// original's.
+//
+// RefundTransaction is the same call with only SkipQueue set.
+func (l *Blnk) RefundTransactionWithOptions(ctx context.Context, transactionID string, opts RefundOptions) (*model.Transaction, error) {
 	ctx, span := tracer.Start(ctx, "RefundTransaction")
 	defer span.End()
 
@@ -211,7 +284,7 @@ func (l *Blnk) RefundTransaction(ctx context.Context, transactionID string, skip
 	}
 
 	// 3. Prepare the refund transaction object
-	refundTxnObject := prepareRefundTransaction(originalTxn, skipQueue)
+	refundTxnObject := prepareRefundTransaction(originalTxn, opts)
 
 	// 4. Queue the refund transaction for processing
 	queuedRefundTxn, err := l.QueueTransaction(ctx, refundTxnObject)
@@ -222,4 +295,118 @@ func (l *Blnk) RefundTransaction(ctx context.Context, transactionID string, skip
 
 	span.AddEvent("Refund transaction queued", trace.WithAttributes(attribute.String("refund.transaction.id", queuedRefundTxn.TransactionID)))
 	return queuedRefundTxn, nil
+}
+
+// errTransactionAlreadyRefunded marks a leg that was already reversed. Fan-out
+// refunds treat this as skippable so a parent refund can finish remaining legs.
+type errTransactionAlreadyRefunded struct {
+	transactionID string
+}
+
+func (e *errTransactionAlreadyRefunded) Error() string {
+	return fmt.Sprintf("transaction %s has already been refunded", e.transactionID)
+}
+
+func isTransactionAlreadyRefundedError(err error) bool {
+	var target *errTransactionAlreadyRefunded
+	return errors.As(err, &target)
+}
+
+func unwrapRefundBatchErrors(err error) ([]error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	type unwrapMultiple interface {
+		Unwrap() []error
+	}
+	u, ok := err.(unwrapMultiple)
+	if !ok {
+		return []error{err}, false
+	}
+	errs := u.Unwrap()
+	if len(errs) == 0 {
+		return nil, true
+	}
+	return errs, true
+}
+
+func allRefundBatchErrorsAreAlreadyRefunded(err error) bool {
+	errs, joined := unwrapRefundBatchErrors(err)
+	if !joined {
+		return isTransactionAlreadyRefundedError(err)
+	}
+	if len(errs) == 0 {
+		return false
+	}
+	for _, e := range errs {
+		if !isTransactionAlreadyRefundedError(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// nonSkippableRefundBatchErrors drops already-refunded legs from a batch error
+// so API classifiers do not treat a mixed failure as a safe idempotent conflict
+// when a fatal leg error is also present.
+func nonSkippableRefundBatchErrors(err error) error {
+	errs, joined := unwrapRefundBatchErrors(err)
+	if !joined {
+		if isTransactionAlreadyRefundedError(err) {
+			return nil
+		}
+		return err
+	}
+	var fatal []error
+	for _, e := range errs {
+		if !isTransactionAlreadyRefundedError(e) {
+			fatal = append(fatal, e)
+		}
+	}
+	if len(fatal) == 0 {
+		return nil
+	}
+	if len(fatal) == 1 {
+		return fatal[0]
+	}
+	return errors.Join(fatal...)
+}
+
+func reconcileRefundBatchResults(applied []*model.Transaction, err error) ([]*model.Transaction, error) {
+	if err == nil {
+		return applied, nil
+	}
+	// Some legs refunded, others were already done — success for the caller.
+	if len(applied) > 0 && allRefundBatchErrorsAreAlreadyRefunded(err) {
+		return applied, nil
+	}
+	if fatal := nonSkippableRefundBatchErrors(err); fatal != nil {
+		return applied, fatal
+	}
+	// Only skippable errors remain and nothing new was applied.
+	return applied, err
+}
+
+// ProcessRefundsInBatches fans out a refund across every refundable leg under
+// parentTransactionID. Legs that were already reversed are skipped; the call
+// succeeds when at least one leg is refunded and fails with conflict only when
+// nothing was left to refund.
+func (l *Blnk) ProcessRefundsInBatches(ctx context.Context, parentTransactionID string, opts RefundOptions) ([]*model.Transaction, error) {
+	ctx, span := tracer.Start(ctx, "ProcessRefundsInBatches")
+	defer span.End()
+
+	applied, err := l.ProcessTransactionInBatches(
+		ctx,
+		parentTransactionID,
+		big.NewInt(0),
+		1,
+		false,
+		l.GetRefundableTransactionsByParentID,
+		l.RefundWorkerWithRefundOptions(opts),
+	)
+	result, reconcileErr := reconcileRefundBatchResults(applied, err)
+	if reconcileErr != nil {
+		span.RecordError(reconcileErr)
+	}
+	return result, reconcileErr
 }
